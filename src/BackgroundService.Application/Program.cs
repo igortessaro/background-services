@@ -1,7 +1,9 @@
 using BackgroundService.Application.BackgroundJobs;
+using BackgroundService.Application.Models;
 using BackgroundService.Application.Services;
 using Hangfire;
 using Hangfire.MemoryStorage;
+using Microsoft.AspNetCore.Mvc;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddControllers();
@@ -20,7 +22,9 @@ builder.Services.AddHangfire(op =>
 builder.Services.AddHangfireServer();
 
 builder.Services.AddScoped<ISendMailService, SendMailService>();
+builder.Services.AddScoped<ISendSmsService, SendSmsService>();
 builder.Services.AddScoped<IEmailBackgroundJob, EmailBackgroundJob>();
+builder.Services.AddScoped<ISmsBackgroundJob, SmsBackgroundJob>();
 
 using var app = builder.Build();
 
@@ -37,7 +41,6 @@ if (app.Environment.IsDevelopment())
 else
 {
     app.UseExceptionHandler("/Home/Error");
-    // The default HSTS value is 30 days. You may want to change this for production scenarios, see https://aka.ms/aspnetcore-hsts.
     app.UseHsts();
 }
 
@@ -50,17 +53,69 @@ var serviceScopeFactory = app.Services.GetRequiredService<IServiceScopeFactory>(
 using var scope = serviceScopeFactory.CreateScope();
 
 var emailBackgroundJob = scope.ServiceProvider.GetRequiredService<IEmailBackgroundJob>();
-BackgroundJob.Enqueue(() => emailBackgroundJob.RunAsync(null));
+var smsBackgroundJob = scope.ServiceProvider.GetRequiredService<ISmsBackgroundJob>();
 
-app.MapGet("/", () => "Hello World!");
-app.MapGet("/person", () =>
+string enqueueId = BackgroundJob.Enqueue(() => emailBackgroundJob.RunAsync(null));
+string scheduleJobId = BackgroundJob.Schedule(() => emailBackgroundJob.RunAsync(null), TimeSpan.FromMinutes(5));
+RecurringJob.AddOrUpdate(() => emailBackgroundJob.RunAsync(null), Cron.Minutely);
+
+app.MapPost("/backgroundjob/recurring", (IServiceProvider serviceProvider, JobModel job) =>
 {
-    var person = new
+    var type = typeof(IBackgroundJob);
+    var backgroundJob = AppDomain.CurrentDomain.GetAssemblies()
+        .SelectMany(s => s.GetTypes())
+        .Where(p => type.IsAssignableFrom(p) && p.IsInterface && p.Name.StartsWith($"I{job.Name}"))
+        .FirstOrDefault();
+
+    if (backgroundJob is null)
     {
-        Name = "John Doe",
-        Age = 42
-    };
-    return person;
+        return Results.BadRequest($"{job.Name} job is not registered");
+    }
+
+    IBackgroundJob? backgroundFromAdd = serviceProvider.GetService(backgroundJob) as IBackgroundJob;
+
+    if (backgroundFromAdd is null)
+    {
+        return Results.BadRequest($"{job.Name} job is not registered");
+    }
+
+    RecurringJob.AddOrUpdate(() => backgroundFromAdd.RunAsync(null), job.Cron);
+
+    return Results.Ok("Enqueued");
+});
+app.MapPost("/backgroundjob/enqueue/{jobName}", (IServiceProvider serviceProvider, string jobName) =>
+{
+    var type = typeof(IBackgroundJob);
+    var backgroundJob = AppDomain.CurrentDomain.GetAssemblies()
+        .SelectMany(s => s.GetTypes())
+        .Where(p => type.IsAssignableFrom(p) && p.IsInterface && p.Name.StartsWith($"I{jobName}"))
+        .FirstOrDefault();
+
+    if (backgroundJob is null)
+    {
+        return Results.BadRequest($"{jobName} job is not registered");
+    }
+
+    IBackgroundJob? backgroundJobFromEnqueue = serviceProvider.GetService(backgroundJob) as IBackgroundJob;
+
+    if (backgroundJobFromEnqueue is null)
+    {
+        return Results.BadRequest($"{jobName} job is not registered");
+    }
+
+    BackgroundJob.Enqueue(() => backgroundJobFromEnqueue.RunAsync(null));
+
+    return Results.Ok("Enqueued");
+});
+app.MapGet("/backgroundjob", () =>
+{
+    var type = typeof(IBackgroundJob);
+    var types = AppDomain.CurrentDomain.GetAssemblies()
+        .SelectMany(s => s.GetTypes())
+        .Where(p => type.IsAssignableFrom(p) && p.IsInterface && !p.Name.Equals(nameof(IBackgroundJob)))
+        .Select(x => x.Name);
+
+    return types;
 });
 
 app.Run();
